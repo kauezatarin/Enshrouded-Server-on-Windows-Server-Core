@@ -8,14 +8,22 @@ $osVersion = (Get-CimInstance Win32_OperatingSystem).Version
 if ($osVersion -match '10\.0\.(14393|17763)') {
     Write-Host "Windows Server 2016/2019 detected."
 }
-# Check if the OS Windows Server 2022
+# Check if the OS is Windows Server 2022
 elseif ($osVersion -match '10\.0\.(20348)') {
     Write-Host "Windows Server 2022 detected."
 }
-else {
-    Write-Host "Unsupported Windows Server version. Please use a supported version of Windows Server."
-	exit
+# Check if the OS is Windows Server 2025
+elseif ($osVersion -match '10\.0\.(26100)') {
+    Write-Host "Windows Server 2025 detected."
 }
+else {
+    Write-Host "Unsupported Windows Server version ($osVersion). Supported versions: Windows Server 2016, 2019, 2022, 2025."
+	exit 1
+}
+
+# Enforce TLS 1.2 and TLS 1.3 for secure downloads
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+
 
 # Function for error logging
 function Log-Error {
@@ -59,14 +67,14 @@ function Test-InternetConnection {
 # Call the function to check for an active internet connection
 Test-InternetConnection
 
-# Check if NuGet is installed
-if (-not (Get-Module -ListAvailable -Name NuGet)) {
+# Check if NuGet package provider is installed
+if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
     try {
         # NuGet is not installed, so install it silently
+        Write-Host "Installing NuGet package provider..."
         Install-PackageProvider -Name NuGet -Force -ForceBootstrap -Scope CurrentUser -Confirm:$false
-        Install-Module -Name NuGet -Force -Scope CurrentUser -Confirm:$false
     } catch {
-        $errorMessage = "Failed to install NuGet. Error: $_"
+        $errorMessage = "Failed to install NuGet package provider. Error: $_"
         Log-Error $errorMessage
         exit 1
     }
@@ -82,21 +90,23 @@ Import-Module PSWindowsUpdate
 # Set the execution policy
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# Check for and install KB5009608 (required to run  Windows desktop application compatibility)
-$kbNumber = 'KB5009608'
-$installedUpdate = Get-HotFix | Where-Object {$_.HotFixID -eq $kbNumber}
+# Check for and install KB5009608 only on Windows Server 2022 (fixes RDP issue with App Compatibility)
+if ($osVersion -match '10\.0\.20348') {
+    $kbNumber = 'KB5009608'
+    $installedUpdate = Get-HotFix | Where-Object {$_.HotFixID -eq $kbNumber}
 
-if ($installedUpdate) {
-    Write-Host "$kbNumber is already installed on this system."
-} else {
-    # Prompt the user to install KB5009608
-    $userChoice = Read-Host -Prompt "$kbNumber is required to run this game server. Do you want to install $kbNumber? (Y/N)"
-
-    if ($userChoice -eq 'Y' -or $userChoice -eq 'Yes') {
-        Get-WindowsUpdate -KBArticleID $kbNumber -Install -AcceptAll
-        Write-Host "Installing $kbNumber..."
+    if ($installedUpdate) {
+        Write-Host "$kbNumber is already installed on this system."
     } else {
-        Write-Host "Installation of $kbNumber canceled."
+        # Prompt the user to install KB5009608
+        $userChoice = Read-Host -Prompt "$kbNumber is recommended for Windows Server 2022 compatibility. Do you want to install $kbNumber? (Y/N)"
+
+        if ($userChoice -eq 'Y' -or $userChoice -eq 'Yes') {
+            Get-WindowsUpdate -KBArticleID $kbNumber -Install -AcceptAll
+            Write-Host "Installing $kbNumber..."
+        } else {
+            Write-Host "Installation of $kbNumber canceled."
+        }
     }
 }
 
@@ -138,19 +148,34 @@ if ($osVersion -match '10\.0\.(14393|17763)') {
     # Run the command for Server 2016 or 2019
     Add-WindowsCapability -Online -Name ServerCore.AppCompatibility
 }
-# Check if the OS Windows Server 2022
-elseif ($osVersion -match '10\.0\.(20348)') {
-    Write-Host "Installing App Compatibility Tools for Windows Server 2022."
-    # Run the command for Server 2022
-    Add-WindowsCapability -Online -Name ServerCore.AppCompatibility~~~~0.0.1.0
+# Check if the OS is Windows Server 2022 or 2025
+elseif ($osVersion -match '10\.0\.(20348|26100)') {
+    $serverNameVer = if ($osVersion -match '26100') { "Windows Server 2025" } else { "Windows Server 2022" }
+    Write-Host "Checking App Compatibility Tools for $serverNameVer..."
+    $appCompat = Get-WindowsCapability -Online -Name "ServerCore.AppCompatibility~~~~0.0.1.0" -ErrorAction SilentlyContinue
+    if ($appCompat -and $appCompat.State -eq 'Installed') {
+        Write-Host "App Compatibility Tools are already installed."
+    } else {
+        Write-Host "Installing App Compatibility Tools for $serverNameVer..."
+        Add-WindowsCapability -Online -Name ServerCore.AppCompatibility~~~~0.0.1.0
+    }
 }
 else {
     Write-Host "Continuing with installation..."
 }
 
-# Install DirectX Configuration Database
-Write-Host "Installing DirectX Configuration Database."
-Add-WindowsCapability -Online -Name DirectX.Configuration.Database~~~~0.0.1.0
+# Install DirectX Configuration Database if not already present
+$dxCompat = Get-WindowsCapability -Online -Name "DirectX.Configuration.Database~~~~0.0.1.0" -ErrorAction SilentlyContinue
+if ($dxCompat -and $dxCompat.State -eq 'Installed') {
+    Write-Host "DirectX Configuration Database is already installed."
+} else {
+    Write-Host "Installing DirectX Configuration Database..."
+    try {
+        Add-WindowsCapability -Online -Name DirectX.Configuration.Database~~~~0.0.1.0 -ErrorAction Stop
+    } catch {
+        Write-Host "DirectX Configuration Database capability installation skipped or not required: $_"
+    }
+}
 
 # Check to see if apps are already installed and install them if they are not
 # Function to check if a command is available
@@ -339,23 +364,16 @@ if (-not (CommandExists 'steamcmd')) {
     Write-Host "SteamCMD is already installed. Skipping installation."
 }
 
-# Function to check if Visual C++ Redistributable 2022 is installed
+# Function to check if Visual C++ Redistributable 2015-2022 is installed
 function Check-VCRedist2022Installed {
     $redistVersion = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction SilentlyContinue
-
-    if ($redistVersion -eq $null) {
-        return $false
-    } else {
-        return $true
-    }
+    return ($null -ne $redistVersion)
 }
 
 # Function to check if Visual C++ Redistributable is installed
 function Check-VCRedist {
-    $vcRedistInstalled = Get-WmiObject -Query "SELECT * FROM Win32_Product WHERE Name LIKE 'Microsoft Visual C++ % Redistributable%'" -ErrorAction SilentlyContinue
-
-    if ($vcRedistInstalled) {
-        Write-Host "Visual C++ Redistributable is already installed."
+    if (Check-VCRedist2022Installed) {
+        Write-Host "Visual C++ 2015-2022 Redistributable (x64) is already installed."
     } else {
         Install-VCRedist
     }
@@ -442,7 +460,7 @@ try {
 }
 
 # Install Enshrouded dedicated server 
-steamcmd +force_install_dir $installDirectory +login anonymous +app_update 2278520 validate +quit
+& steamcmd "+force_install_dir" "$installDirectory" "+login" "anonymous" "+app_update" "2278520" "validate" "+quit"
 
 # Create the Enshrouded config file and write the contents of the file
 # Prompt the user for server name
@@ -517,8 +535,9 @@ function CheckAndCreateFirewallRule($port, $protocol, $ruleName) {
     }
 }
 
-# Check and create firewall rules
-CheckAndCreateFirewallRule $gamePort "TCP" "EnshroudedGamePort"
+# Check and create firewall rules (Enshrouded uses UDP for game and query traffic, TCP can also be allowed)
+CheckAndCreateFirewallRule $gamePort "UDP" "EnshroudedGamePortUDP"
+CheckAndCreateFirewallRule $gamePort "TCP" "EnshroudedGamePortTCP"
 CheckAndCreateFirewallRule $queryPort "UDP" "EnshroudedQueryPort"
 
 # Create a shortcut link to the Enshrouded server application in the home directory. This will allow you to run the server at logon by typing '.\enserver.lnk' 
@@ -572,7 +591,13 @@ function Create-ServerBackupScheduledTask {
     }
 
     # Prompt for task frequency
-    $taskFrequency = Read-Host "How often should the backup run? (Daily, Weekly, Bi-weekly, Monthly)"
+    $taskFrequencyInput = Read-Host "How often should the backup run? (Daily, Weekly, Bi-weekly, Monthly) [Default: Daily]"
+    switch -Regex ($taskFrequencyInput) {
+        "Weekly"    { $sc = "WEEKLY"; $mo = 1 }
+        "Bi-weekly" { $sc = "WEEKLY"; $mo = 2 }
+        "Monthly"   { $sc = "MONTHLY"; $mo = 1 }
+        Default     { $sc = "DAILY"; $mo = 1 }
+    }
 
     # Prompt for task execution time
     $taskExecutionTime = $null
@@ -580,19 +605,16 @@ function Create-ServerBackupScheduledTask {
         $taskExecutionTime = Read-Host "What time should the backup run? (24-hour format, e.g., 14:30)"
     }
 
-    # Create scheduled task with repetition to run indefinitely
-    $taskAction = New-ScheduledTaskAction -Execute "robocopy" -Argument "$installDirectory $backupDirectory /MIR /R:0 /W:0 /NFL /NDL /NP"
+    # Create the scheduled task using schtasks.exe with properly escaped quotes and valid schedule parameters
+    $robocopyCmd = "robocopy `"$installDirectory`" `"$backupDirectory`" /MIR /R:0 /W:0 /NFL /NDL /NP"
+    $taskName = "Enshrouded Server Backup"
+    if ($sc -eq "WEEKLY" -and $mo -eq 2) {
+        schtasks.exe /Create /TN $taskName /TR $robocopyCmd /SC WEEKLY /MO 2 /ST $taskExecutionTime /F
+    } else {
+        schtasks.exe /Create /TN $taskName /TR $robocopyCmd /SC $sc /ST $taskExecutionTime /F
+    }
 
-    # Create a string representing the repetition interval
-    $repetitionInterval = 'P99999DT23H59M59S'
-
-    # Create a string representing the repetition duration
-    $repetitionDuration = 'P99999DT23H59M59S'
-
-    # Create the scheduled task using schtasks.exe
-    schtasks.exe /Create /TN "Server Backup - $(Get-Date -Format 'yyyyMMddHHmmss')" /TR "robocopy '$installDirectory' '$backupDirectory' /MIR /R:0 /W:0 /NFL /NDL /NP" /SC ONCE /ST $taskExecutionTime /RI $repetitionInterval /DU $repetitionDuration /F
-
-    Write-Host "Scheduled task created successfully."
+    Write-Host "Scheduled task '$taskName' created successfully."
 }
 
 # Create the scheduled task

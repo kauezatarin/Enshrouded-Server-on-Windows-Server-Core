@@ -36,8 +36,8 @@ do {
             $installDirectory = $foundFile.Directory.FullName
 
             # Run the specified SteamCMD command
-            $steamcmdCommand = "steamcmd +force_install_dir $installDirectory +login anonymous +app_update 2278520 validate +quit"
-            Invoke-Expression -Command $steamcmdCommand
+            Write-Host "Updating Enshrouded Dedicated Server at $installDirectory..."
+            & steamcmd "+force_install_dir" "$installDirectory" "+login" "anonymous" "+app_update" "2278520" "validate" "+quit"
             Write-Host "Enshrouded Server update executed successfully!"
         } else {
             throw "$fileToSearch not found in $searchPath or its subdirectories. Please try again."
